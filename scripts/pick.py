@@ -5,10 +5,16 @@
   python3 pick.py overview [科目]
   python3 pick.py pick  --科目 人力资源 [--范围 组织行为] [--n 10] [--题型 多选题]
                         [--星级 3] [--真题] [--考点 需要层次理论] [--排除已做]
+                        [--藏答案]                 # 只出题不出答案，判卷走 answers
+  python3 pick.py answers HR-Q00123 EB-Q00353      # 按ID取答案+解析
+  python3 pick.py answers HR-Q00123:AB EB-Q00353:C # 顺手判对错并算分
   python3 pick.py kp 需要层次理论 [--科目 人力资源]
   python3 pick.py weak  --科目 人力资源            # 按错题本算薄弱考点
   python3 pick.py log   --题目ID HR-Q00123 --结果 错 [--我的答案 AB] [--日期 2026-08-23]
   python3 pick.py wrong --科目 人力资源 [--n 10]   # 取错题重做
+
+判卷只认题目ID。题库里「题干几乎一样、答案不一样」的重题有 166 组
+（同一考点的单选/多选版本、不同年份的改编版），拿题干关键词反查必串题。
 
 错题本是 _错题本.md：正文按考点分组、带完整题目和解析，给人看；
 文件末尾的 tsv 代码块是做题流水，程序读它，每次 log 会重写整篇正文。
@@ -20,6 +26,7 @@ import json
 import os
 import random
 import re
+import sys
 from collections import Counter, defaultdict
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -223,6 +230,102 @@ def fmt(q, show_answer=True, n=None, st=None):
     return "\n".join(lines)
 
 
+def letters(s):
+    """把答案串规整成字母集合。'A、C D' / 'acd' / 'ACD' 都吃。"""
+    return set(re.findall(r"[A-E]", (s or "").upper()))
+
+
+def judge(q, mine):
+    """按 ID 拿到的题 + 用户答案 → (对/错, 说明, 得分)。
+    判定写在代码里，不让模型自己比字母——多选漏选一个最容易看漏。
+    计分按中级经济师规则：单选 1 分；多选 2 分，全对 2 分，
+    少选每个 0.5 分，错选/多选 0 分。"""
+    right, got = letters(q.get("答案")), letters(mine)
+    duo = (q.get("题型") or "") == "多选题"
+    if not right:
+        return "无法判定", "题库里这题没有答案（质量多半是「仅参考」）", None
+    if not got:
+        return "错", f"没作答，正确答案 {''.join(sorted(right))}", 0.0
+    if got == right:
+        return "对", "", 2.0 if duo else 1.0
+    if not duo:                      # 单选/判断：说清正确答案就够，别写「漏选/多选」
+        return "错", f"正确答案 {''.join(sorted(right))}", 0.0
+    miss, extra = sorted(right - got), sorted(got - right)
+    bits = []
+    if miss:
+        bits.append("漏选 " + "".join(miss))
+    if extra:
+        bits.append("多选/错选 " + "".join(extra))
+    why = "，".join(bits) + f"；正确答案 {''.join(sorted(right))}"
+    score = 0.0 if extra else 0.5 * len(got)
+    return "错", why, score
+
+
+def cmd_answers(a):
+    """按题目ID取答案和解析。判卷只许走这条路，不许拿题干去反查——
+    题库里题干几乎一样、答案不一样的重题有 160 多组，关键词匹配必然串题。"""
+    idx = {q["题目ID"]: q for q in load()}
+    items = []
+    for tok in a.题目ID:
+        qid, sep, mine = tok.partition(":")
+        # 有冒号就算「作答了」，冒号后面空着 = 没选，照样判错记 0 分
+        items.append((qid.strip().upper(), mine.strip() if sep else None))
+    st = srs(load_log())
+    print(f"# answers {len(items)} 道（顺序和你给的一致）")
+    n_bad = n_right = 0
+    total = maxtotal = 0.0
+    for i, (qid, mine) in enumerate(items, 1):
+        q = idx.get(qid)
+        print()
+        if not q:
+            n_bad += 1
+            print(f"### {i}. [{qid}] 未找到")
+            print("   题库里没这个ID。核对抽题时那行「题号→ID」，别用题干关键词反查。")
+            continue
+        tags = [t for t in (q.get("知识点"), q.get("章节"),
+                            f"{q['考试年份']}真题" if q.get("考试年份") else q.get("题源类型"),
+                            srs_tag(st.get(qid))) if t]
+        print(f"### {i}. [{qid}] {q.get('题型') or '?'}  ({' / '.join(tags)})")
+        if q.get("质量") != "可刷":
+            print(f"注意：这题质量是「{q.get('质量')}」，pick 不会出它——"
+                  "多半是 OCR 缺了选项或两处收录答案打架，别拿它当标准答案。")
+        print("题干：" + (q.get("题干") or "")[:60] + ("…" if len(q.get("题干") or "") > 60 else ""))
+        print("答案：" + (q.get("答案") or "?"))
+        show = sorted(q.get("选项") or {}) if a.全选项 else []
+        if mine is not None:
+            verdict, why, score = judge(q, mine)
+            said = f"你选 {mine}" if mine else "你没作答"
+            print(f"判定：{verdict}　{said}" + (f"　{why}" if why else ""))
+            if verdict == "错" and not a.全选项:
+                # 只列吵起来的那几个选项，讲错因够用，又不把上下文撑爆
+                show = sorted(letters(q.get("答案")) | letters(mine))
+            if score is not None:
+                full = 2.0 if (q.get("题型") or "") == "多选题" else 1.0
+                total += score; maxtotal += full
+                if verdict == "对":
+                    n_right += 1
+                if score and verdict == "错":
+                    print(f"得分：{score:g} / {full:g}（少选按每个 0.5 分）")
+        for c in show:
+            if c in (q.get("选项") or {}):
+                mark = "√" if c in letters(q.get("答案")) else "×"
+                print(f"  {mark} {c}. {q['选项'][c]}")
+        if q.get("解析"):
+            print("解析：" + expl_of(q))
+        if q.get("存疑"):
+            print("存疑：" + "；".join(q["存疑"]))
+        print(f"出处：{prov(q)}")
+    graded = [x for x in items if x[1] is not None]
+    if graded:
+        print(f"\n# 共 {len(graded)} 题带答案，对 {n_right} 错 {len(graded) - n_right}"
+              f"，得分 {total:g}/{maxtotal:g}")
+        rec = " ".join(f"{qid}:{'对' if judge(idx[qid], mine)[0] == '对' else '错'}:{mine}"
+                       for qid, mine in graded if qid in idx)
+        print(f"# 记进错题本： python3 {sys.argv[0]} logs {rec}")
+    if n_bad:
+        print(f"\n# 有 {n_bad} 个ID查不到，别猜，回去看抽题时的ID清单。")
+
+
 def cmd_overview(a):
     with open(os.path.join(BANK, "_索引.json"), encoding="utf-8") as f:
         idx = json.load(f)
@@ -310,9 +413,16 @@ def cmd_pick(a):
           f"{' / ' + a.范围 if a.范围 else ''}）"
           + ("　抽法：均匀随机" if a.均匀
              else f"　抽法：按权重（复习旧题 {n_old} 道，新题 {len(picked) - n_old} 道）"))
+    # 题号→ID 必须留档：判卷只能按ID回查，拿题干关键词反查会串到重题上
+    print("# 题号→ID： " + "  ".join(f"{i}={q['题目ID']}"
+                                   for i, q in enumerate(picked, 1)))
+    print(f"# 判卷： python3 {sys.argv[0]} answers "
+          + " ".join(f"{q['题目ID']}:用户答案" for q in picked))
     for i, q in enumerate(picked, 1):
         print()
-        print(fmt(q, show_answer=True, n=i, st=state.get(q["题目ID"])))
+        print(fmt(q, show_answer=not a.藏答案, n=i, st=state.get(q["题目ID"])))
+    if a.藏答案:
+        print("\n# 本次没带答案。收到用户作答后用上面那条 answers 命令取答案判卷。")
 
 
 def cmd_kp(a):
@@ -593,9 +703,16 @@ def cmd_wrong(a):
                            -state.get(q["题目ID"], {}).get("权重", 1)))
     print(f"# 错题重做 {min(len(qs), a.n)} / 共 {len(qs)} 道"
           f"（其中已到复习点 {sum(1 for q in qs if state.get(q['题目ID'], {}).get('到期'))} 道）")
-    for i, q in enumerate(qs[:a.n], 1):
+    shown = qs[:a.n]
+    print("# 题号→ID： " + "  ".join(f"{i}={q['题目ID']}"
+                                   for i, q in enumerate(shown, 1)))
+    print(f"# 判卷： python3 {sys.argv[0]} answers "
+          + " ".join(f"{q['题目ID']}:用户答案" for q in shown))
+    for i, q in enumerate(shown, 1):
         print()
-        print(fmt(q, show_answer=True, n=i, st=state.get(q["题目ID"])))
+        print(fmt(q, show_answer=not a.藏答案, n=i, st=state.get(q["题目ID"])))
+    if a.藏答案:
+        print("\n# 本次没带答案。收到用户作答后用上面那条 answers 命令取答案判卷。")
 
 
 def cmd_logs(a):
@@ -641,8 +758,15 @@ def main():
     k.add_argument("--排除已做", action="store_true")
     k.add_argument("--保留重题", action="store_true")
     k.add_argument("--均匀", action="store_true", help="关掉权重，纯随机抽")
+    k.add_argument("--藏答案", action="store_true",
+                   help="只出题不出答案；判卷用 answers 按ID回查")
     k.add_argument("--seed", type=int, default=None)
     k.set_defaults(fn=cmd_pick)
+
+    an = sub.add_parser("answers", help="按题目ID取答案+解析，可顺手判对错")
+    an.add_argument("题目ID", nargs="+", help="HR-Q00123 或 HR-Q00123:AB（带上作答就判）")
+    an.add_argument("--全选项", action="store_true", help="连选项原文一起打出来")
+    an.set_defaults(fn=cmd_answers)
 
     kp = sub.add_parser("kp"); kp.add_argument("关键词")
     kp.add_argument("--科目"); kp.add_argument("--n", type=int, default=3)
@@ -662,6 +786,8 @@ def main():
 
     wr = sub.add_parser("wrong"); wr.add_argument("--科目")
     wr.add_argument("--n", type=int, default=10)
+    wr.add_argument("--藏答案", action="store_true",
+                    help="只出题不出答案；判卷用 answers 按ID回查")
     wr.add_argument("--seed", type=int, default=None); wr.set_defaults(fn=cmd_wrong)
 
     a = p.parse_args()
