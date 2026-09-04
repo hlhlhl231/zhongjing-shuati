@@ -99,7 +99,8 @@ def load_log():
     """
     if not os.path.exists(WRONG):
         return []
-    txt = open(WRONG, encoding="utf-8").read()
+    with open(WRONG, encoding="utf-8") as f:
+        txt = f.read()
     tail = txt.split(LEDGER_HEAD)[-1] if LEDGER_HEAD in txt else ""
     out = []
     for line in tail.splitlines():
@@ -209,14 +210,14 @@ def expl_of(q):
     return re.sub(r"^[：:\s　]+", "", q.get("解析") or "")
 
 
-def fmt(q, show_answer=True, n=None, st=None):
+def fmt(q, show_answer=True, n=None, st=None, show_material=True):
     head = f"[{q['题目ID']}] {q['题型'] or '?'}"
     tags = [t for t in (q.get("知识点"), q.get("章节"),
                         f"{q['考试年份']}真题" if q.get("考试年份") else q.get("题源类型"),
                         srs_tag(st) if show_answer else None)
             if t]
-    lines = [f"{'### 第%d题 ' % n if n else ''}{head}  ({' / '.join(tags)})"]
-    if q.get("案例材料"):
+    lines = [f"{'### 第%s题 ' % n if n else ''}{head}  ({' / '.join(tags)})"]
+    if show_material and q.get("案例材料"):
         lines.append("材料：" + q["案例材料"])
     lines.append("题干：" + (q["题干"] or ""))
     for k in sorted(q["选项"]):
@@ -227,6 +228,67 @@ def fmt(q, show_answer=True, n=None, st=None):
             lines.append("解析：" + expl_of(q))
         if q.get("存疑"):
             lines.append("存疑：" + "；".join(q["存疑"]))
+    return "\n".join(lines)
+
+
+def case_key(q):
+    """案例组的稳定键。老数据允许同名组只在一个来源文件内唯一。"""
+    cid = q.get("案例组")
+    return (q.get("来源文件") or "", cid) if cid else None
+
+
+def group_case_units(qs):
+    """把题目整理成顶层题单元：普通题一项，案例组整组一项。"""
+    units, case_index = [], {}
+    for q in qs:
+        key = case_key(q)
+        if key is None:
+            units.append([q])
+            continue
+        if key not in case_index:
+            case_index[key] = len(units)
+            units.append([])
+        units[case_index[key]].append(q)
+
+    def ordered(unit):
+        if case_key(unit[0]) is None:
+            return unit
+        return sorted(unit, key=lambda q: (
+            q.get("卷内题号") is None, str(q.get("卷内题号") or ""),
+            q["题目ID"]))
+
+    return [ordered(unit) for unit in units]
+
+
+def unit_weight(unit, state):
+    """案例作为一个顶层题：组里任一子题到期，整组就按最高权重出现。"""
+    return max(state.get(q["题目ID"], {}).get("权重", 1.0) for q in unit)
+
+
+def unit_ids(unit):
+    return ",".join(q["题目ID"] for q in unit)
+
+
+def id_map(units):
+    return "  ".join(f"{i}={unit_ids(unit)}" for i, unit in enumerate(units, 1))
+
+
+def fmt_unit(unit, show_answer=True, n=None, state=None):
+    """输出一个顶层题单元；案例材料只给一次，子题完整展开。"""
+    if len(unit) == 1:
+        q = unit[0]
+        return fmt(q, show_answer=show_answer, n=n,
+                   st=state.get(q["题目ID"]) if state else None)
+
+    lines = [f"### 第{n}题 案例分析题（共 {len(unit)} 小题）"]
+    material = next((q.get("案例材料") for q in unit if q.get("案例材料")), None)
+    if material:
+        lines.append("材料：" + material)
+    for i, q in enumerate(unit, 1):
+        lines.append("")
+        lines.append(fmt(q, show_answer=show_answer, n=f"{n}.{i}",
+                         st=state.get(q["题目ID"]) if state else None,
+                         show_material=False))
     return "\n".join(lines)
 
 
@@ -378,49 +440,35 @@ def cmd_pick(a):
         qs = [q for q in qs if kp.get(q.get("知识点ID"), 0) >= a.星级]
     if a.排除已做:
         done = {x["题目ID"] for x in load_log()}
-        qs = [q for q in qs if q["题目ID"] not in done]
+        qs = [q for unit in group_case_units(qs)
+              if not all(q["题目ID"] in done for q in unit)
+              for q in unit]
     if not qs:
         print("没有符合条件的题。放宽条件试试（去掉 --星级 或 --真题）。")
         return
+    units = group_case_units(qs)
+    requested = max(a.n, 1)
     random.seed(a.seed)
     state = {} if a.均匀 else srs(load_log())
     if a.均匀:
-        random.shuffle(qs)
+        random.shuffle(units)
     else:
-        qs = wsample(qs, [state.get(q["题目ID"], {}).get("权重", 1.0) for q in qs],
-                     min(len(qs), max(a.n * 4, 40)))
-    # 案例题按组抽，材料不能拆开
-    picked, seen_case = [], set()
-    for q in qs:
-        if len(picked) >= a.n:
-            break
-        cid = q.get("案例组")
-        if cid:
-            # 老数据的 案例组 只在单个来源文件内唯一，得带上文件名一起当键；
-            # 清洗版已经把 案例组 做成全局唯一，没有 来源文件 字段
-            key = (q.get("来源文件") or "", cid)
-            if key in seen_case:
-                continue
-            seen_case.add(key)
-            group = [x for x in qs if x.get("案例组") == cid
-                     and (x.get("来源文件") or "") == (q.get("来源文件") or "")]
-            picked.extend(sorted(group, key=lambda x: x.get("卷内题号") or 0))
-        else:
-            picked.append(q)
-    picked = picked[:max(a.n, 1)]
-    n_old = sum(1 for q in picked if q["题目ID"] in state)
-    print(f"# 抽到 {len(picked)} 题（{subject or '两科'}"
+        units = wsample(units, [unit_weight(unit, state) for unit in units],
+                        min(len(units), max(requested * 4, 40)))
+    units = units[:requested]
+    picked = [q for unit in units for q in unit]
+    n_old = sum(1 for unit in units if any(q["题目ID"] in state for q in unit))
+    print(f"# 抽到 {len(units)} 题（共 {len(picked)} 小题，{subject or '两科'}"
           f"{' / ' + a.范围 if a.范围 else ''}）"
           + ("　抽法：均匀随机" if a.均匀
-             else f"　抽法：按权重（复习旧题 {n_old} 道，新题 {len(picked) - n_old} 道）"))
+             else f"　抽法：按权重（复习旧题 {n_old} 道，新题 {len(units) - n_old} 道）"))
     # 题号→ID 必须留档：判卷只能按ID回查，拿题干关键词反查会串到重题上
-    print("# 题号→ID： " + "  ".join(f"{i}={q['题目ID']}"
-                                   for i, q in enumerate(picked, 1)))
+    print("# 题号→ID： " + id_map(units))
     print(f"# 判卷： python3 {sys.argv[0]} answers "
           + " ".join(f"{q['题目ID']}:用户答案" for q in picked))
-    for i, q in enumerate(picked, 1):
+    for i, unit in enumerate(units, 1):
         print()
-        print(fmt(q, show_answer=not a.藏答案, n=i, st=state.get(q["题目ID"])))
+        print(fmt_unit(unit, show_answer=not a.藏答案, n=i, state=state))
     if a.藏答案:
         print("\n# 本次没带答案。收到用户作答后用上面那条 answers 命令取答案判卷。")
 
@@ -692,25 +740,51 @@ def cmd_wrong(a):
     for x in log:
         latest[x["题目ID"]] = x.get("结果")
     ids = {k for k, v in latest.items() if v == "错"}
-    qs = [q for q in load(subject) if q["题目ID"] in ids]
+    allq = load(subject)
+    qs = [q for q in allq if q["题目ID"] in ids]
     if not qs:
         print("没有待复习的错题。")
         return
     state = srs(log)
+    all_units = group_case_units(allq)
+    full_units = {case_key(unit[0]): unit for unit in all_units
+                  if case_key(unit[0]) is not None}
+    units, seen_cases = [], set()
+    for q in qs:
+        key = case_key(q)
+        if key is None:
+            units.append([q])
+            continue
+        if key in seen_cases:
+            continue
+        seen_cases.add(key)
+        units.append(full_units.get(key, [q]))
+
     # 该复习的排前面：到期的优先，其次错得多的
-    qs.sort(key=lambda q: (not state.get(q["题目ID"], {}).get("到期", True),
-                           -state.get(q["题目ID"], {}).get("错次", 0),
-                           -state.get(q["题目ID"], {}).get("权重", 1)))
-    print(f"# 错题重做 {min(len(qs), a.n)} / 共 {len(qs)} 道"
-          f"（其中已到复习点 {sum(1 for q in qs if state.get(q['题目ID'], {}).get('到期'))} 道）")
-    shown = qs[:a.n]
-    print("# 题号→ID： " + "  ".join(f"{i}={q['题目ID']}"
-                                   for i, q in enumerate(shown, 1)))
+    def wrong_rank(unit):
+        wrong_qs = [q for q in unit if q["题目ID"] in ids]
+        due = any(state.get(q["题目ID"], {}).get("到期", True)
+                  for q in wrong_qs)
+        wrong_count = max(state.get(q["题目ID"], {}).get("错次", 0)
+                          for q in wrong_qs)
+        weight = max(state.get(q["题目ID"], {}).get("权重", 1.0)
+                     for q in wrong_qs)
+        return (not due, -wrong_count, -weight)
+
+    units.sort(key=wrong_rank)
+    shown = units[:max(a.n, 1)]
+    subquestions = [q for unit in shown for q in unit]
+    due_units = sum(1 for unit in units if any(
+        state.get(q["题目ID"], {}).get("到期", True)
+        for q in unit if q["题目ID"] in ids))
+    print(f"# 错题重做 {len(shown)} / 共 {len(units)} 组（共 {len(subquestions)} 小题）"
+          f"（其中已到复习点 {due_units} 组）")
+    print("# 题号→ID： " + id_map(shown))
     print(f"# 判卷： python3 {sys.argv[0]} answers "
-          + " ".join(f"{q['题目ID']}:用户答案" for q in shown))
-    for i, q in enumerate(shown, 1):
+          + " ".join(f"{q['题目ID']}:用户答案" for q in subquestions))
+    for i, unit in enumerate(shown, 1):
         print()
-        print(fmt(q, show_answer=not a.藏答案, n=i, st=state.get(q["题目ID"])))
+        print(fmt_unit(unit, show_answer=not a.藏答案, n=i, state=state))
     if a.藏答案:
         print("\n# 本次没带答案。收到用户作答后用上面那条 answers 命令取答案判卷。")
 
